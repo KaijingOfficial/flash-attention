@@ -3140,3 +3140,142 @@ def flash_attn_combine(
         varlen_batch_idx=varlen_batch_idx,
     )
     return out, lse
+
+
+_KVCACHE_OUT_OF_SCOPE_KWARGS = (
+    "rotary_cos", "rotary_sin", "cache_batch_idx", "cache_leftpad",
+    "page_table", "window_size", "attention_chunk", "softcap",
+    "rotary_interleaved", "rotary_seqlens",
+    "q_descale", "k_descale", "v_descale",
+    "pack_gqa", "cu_seqlens_q", "cu_seqlens_k_new", "max_seqlen_q",
+    "scheduler_metadata", "sm_margin", "return_softmax_lse",
+)
+
+
+def flash_attn_with_kvcache_func(
+    q,
+    k,
+    v,
+    k_cache,
+    v_cache,
+    cache_seqlens,
+    *,
+    causal: bool = False,
+    softmax_scale=None,
+    num_splits: int = 1,
+    **kwargs,
+):
+    """FA4 drop-in for FA3's flash_attn_with_kvcache, minimal P0 subset.
+
+    Args are documented in the design spec §2. Layout is [B, seq_new, H, D]
+    for q/k/v and [B, max_seq, H, D] for k_cache/v_cache. cache_seqlens is
+    [B] int32. The kernel writes k[b] into k_cache[b, cache_seqlens[b] :
+    cache_seqlens[b] + seq_new] in place (same for v). This function is
+    inference-only; wrap the call in torch.no_grad() or inference_mode().
+    """
+    # 1. Out-of-scope kwargs — reject before doing anything else.
+    for name in _KVCACHE_OUT_OF_SCOPE_KWARGS:
+        if name in kwargs and kwargs[name] is not None:
+            raise NotImplementedError(
+                f"flash_attn_with_kvcache_func: kwarg {name!r} is out of P0 "
+                f"scope. Supported kwargs: q, k, v, k_cache, v_cache, "
+                f"cache_seqlens, causal (only False), softmax_scale, "
+                f"num_splits (only 1)."
+            )
+    # Any *other* unexpected kwarg — also reject.
+    extra = set(kwargs) - set(_KVCACHE_OUT_OF_SCOPE_KWARGS)
+    if extra:
+        raise TypeError(
+            f"flash_attn_with_kvcache_func got unexpected kwargs: {sorted(extra)}"
+        )
+
+    # 2. causal / num_splits
+    if causal is not False:
+        raise NotImplementedError(
+            "flash_attn_with_kvcache_func: only causal=False supported."
+        )
+    if num_splits != 1:
+        raise NotImplementedError(
+            "flash_attn_with_kvcache_func: only num_splits=1 supported."
+        )
+
+    # 3. Shape / rank
+    for name, t in (("q", q), ("k", k), ("v", v),
+                    ("k_cache", k_cache), ("v_cache", v_cache)):
+        if t.dim() != 4:
+            raise RuntimeError(
+                f"flash_attn_with_kvcache_func: {name} must have rank 4 "
+                f"[B, S, H, D], got rank {t.dim()}."
+            )
+    B, seq_new, H, D = q.shape
+    if k.shape != (B, seq_new, k.shape[2], D) or v.shape != k.shape:
+        raise RuntimeError(
+            f"flash_attn_with_kvcache_func: k/v must have shape "
+            f"[{B}, {seq_new}, KV_H, {D}], got k={tuple(k.shape)}, "
+            f"v={tuple(v.shape)}."
+        )
+    if k.shape[2] != H:
+        raise NotImplementedError(
+            "flash_attn_with_kvcache_func: MHA only, k/v head count must "
+            f"equal q head count (got q_H={H}, kv_H={k.shape[2]})."
+        )
+    if k_cache.shape[0] != B or k_cache.shape[2] != H or k_cache.shape[3] != D:
+        raise RuntimeError(
+            f"flash_attn_with_kvcache_func: k_cache must have shape "
+            f"[{B}, max_seq, {H}, {D}], got {tuple(k_cache.shape)}."
+        )
+    if v_cache.shape != k_cache.shape:
+        raise RuntimeError(
+            f"flash_attn_with_kvcache_func: v_cache shape {tuple(v_cache.shape)} "
+            f"must match k_cache shape {tuple(k_cache.shape)}."
+        )
+    max_seq = k_cache.shape[1]
+
+    # 4. Dtype
+    import torch as _torch
+    allowed = (_torch.bfloat16, _torch.float16)
+    if q.dtype not in allowed:
+        raise RuntimeError(
+            f"flash_attn_with_kvcache_func: dtype {q.dtype} not supported; "
+            f"expected bf16 or fp16."
+        )
+    for name, t in (("k", k), ("v", v), ("k_cache", k_cache), ("v_cache", v_cache)):
+        if t.dtype != q.dtype:
+            raise RuntimeError(
+                f"flash_attn_with_kvcache_func: dtype mismatch — q is "
+                f"{q.dtype} but {name} is {t.dtype}."
+            )
+
+    # 5. cache_seqlens
+    if cache_seqlens.dim() != 1 or cache_seqlens.shape[0] != B:
+        raise RuntimeError(
+            f"flash_attn_with_kvcache_func: cache_seqlens must have shape "
+            f"[{B}], got {tuple(cache_seqlens.shape)}."
+        )
+    if cache_seqlens.dtype != _torch.int32:
+        raise RuntimeError(
+            f"flash_attn_with_kvcache_func: cache_seqlens must be int32, "
+            f"got {cache_seqlens.dtype}."
+        )
+
+    # 6. Autograd
+    if q.requires_grad or k.requires_grad or v.requires_grad:
+        raise RuntimeError(
+            "flash_attn_with_kvcache_func: kvcache path is inference-only; "
+            "wrap the call in torch.no_grad() or inference_mode()."
+        )
+
+    # 7. Bounds — check on CPU copy of cache_seqlens (cheap; B is small).
+    cs_cpu = cache_seqlens.detach().to("cpu")
+    max_used = int(cs_cpu.max().item()) + int(seq_new)
+    if max_used > max_seq:
+        raise RuntimeError(
+            f"flash_attn_with_kvcache_func: cache overflow — max(cache_seqlens) "
+            f"+ seq_new = {max_used} exceeds max_seq = {max_seq}."
+        )
+
+    # 8. Kernel not yet wired.
+    raise NotImplementedError(
+        "flash_attn_with_kvcache_func: kernel wiring pending; will land in "
+        "Task 5 of the fa4-kvcache-non-paged plan."
+    )

@@ -10,9 +10,11 @@ except PackageNotFoundError:
 from .interface import (
     flash_attn_func,
     flash_attn_varlen_func,
+    flash_attn_with_kvcache_func,
 )
 
 __all__ = [
     "flash_attn_func",
     "flash_attn_varlen_func",
+    "flash_attn_with_kvcache_func",
 ]
