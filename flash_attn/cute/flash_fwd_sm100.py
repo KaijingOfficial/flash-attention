@@ -141,8 +141,16 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        kvcache_mode: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
+        self.kvcache_mode = kvcache_mode
+        if kvcache_mode:
+            # kvcache path uses the cp.async loader (paged-style) so we can
+            # per-row predicate boundary tiles and fuse an smem→gmem write-back.
+            # TMA cannot per-row predicate, so force it off. Task 3b relies on
+            # this invariant.
+            self.use_tma_KV = False
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -401,6 +409,9 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
+        mK_new: Optional[cute.Tensor] = None,
+        mV_new: Optional[cute.Tensor] = None,
+        mCache_seqlens: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -417,6 +428,16 @@ class FlashAttentionForwardSm100:
         5. Grid and work scheduling computation
         6. Kernel launch with appropriate parameters
         """
+        # kvcache_mode plumbing consistency (Task 3a; loader semantics land in Task 3b).
+        # const_expr compiles away the False branch entirely — non-kvcache codegen is unchanged.
+        if const_expr(self.kvcache_mode):
+            assert mK_new is not None and mV_new is not None and mCache_seqlens is not None, (
+                "kvcache_mode=True requires mK_new, mV_new, mCache_seqlens"
+            )
+        else:
+            assert mK_new is None and mV_new is None and mCache_seqlens is None, (
+                "kvcache_mode=False must not receive mK_new/mV_new/mCache_seqlens"
+            )
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -784,6 +805,9 @@ class FlashAttentionForwardSm100:
             aux_data,
             fastdiv_mods,
             head_divmod,
+            mK_new,
+            mV_new,
+            mCache_seqlens,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -843,6 +867,12 @@ class FlashAttentionForwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
+        # used in Task 3b
+        mK_new: Optional[cute.Tensor] = None,
+        # used in Task 3b
+        mV_new: Optional[cute.Tensor] = None,
+        # used in Task 3b
+        mCache_seqlens: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
